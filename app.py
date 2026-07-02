@@ -1,9 +1,9 @@
 """
-Image Processor v1.0 — για efood PIM catalog images
-====================================================
+Image Processor v1.0
+==============================================================
 
 Standalone Streamlit εργαλείο που:
-1. Διαβάζει barcode + rough_desc από το ίδιο Google Sheet του PIM app
+1. Διαβάζει barcode + rough_desc από Google Sheet
 2. Ψάχνει εικόνα με Serper (πολλαπλά queries)
 3. Vision verification (Gemini) — filter watermarks, wrong products, promo combos
 4. Αν η εικόνα έχει λευκό φόντο → επεξεργάζεται:
@@ -12,9 +12,6 @@ Standalone Streamlit εργαλείο που:
 5. Αν δεν βρεθεί κατάλληλη εικόνα → skip και προχωράει στην επόμενη
 6. Γράφει στο sheet: στήλη L (local filename) + στήλη AB (status)
 7. Στο τέλος: ZIP με όλες τις processed εικόνες → download button
-
-ΣΗΜΕΙΩΣΗ: δεν χρησιμοποιεί rembg ή watermark AI — βασίζεται σε καλή αναζήτηση
-και vision filtering για να βρει καθαρές εικόνες.
 """
 
 import streamlit as st
@@ -37,7 +34,8 @@ from PIL import Image, ImageOps
 # ==========================================
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1SxXIo9LswpZxXL8ceHioKWb8DLaSqyUzR0V5Mw9jVQM/edit#gid=0"
+# v1.1: SHEET_URL από secrets ώστε να μη γίνεται δημόσιο σε public repo
+SHEET_URL = st.secrets.get("SHEET_URL", "")
 
 GEMINI_VISION_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
