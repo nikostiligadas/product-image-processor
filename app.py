@@ -1,5 +1,5 @@
 """
-Image Processor v1.0
+Image Processor v1.1 — με Google Drive upload
 ==============================================================
 
 Standalone Streamlit εργαλείο που:
@@ -9,9 +9,12 @@ Standalone Streamlit εργαλείο που:
 4. Αν η εικόνα έχει λευκό φόντο → επεξεργάζεται:
    - Auto-crop το προϊόν (remove περιττά κενά)
    - Center σε 1280x720 canvas με λευκό φόντο
-5. Αν δεν βρεθεί κατάλληλη εικόνα → skip και προχωράει στην επόμενη
-6. Γράφει στο sheet: στήλη L (local filename) + στήλη AB (status)
-7. Στο τέλος: ZIP με όλες τις processed εικόνες → download button
+5. Αν δεν βρεθεί κατάλληλη εικόνα → skip
+6. Ανεβάζει την επεξεργασμένη εικόνα σε Google Drive (public)
+7. Γράφει στο sheet: στήλη L (public URL) + στήλη AB (status)
+
+Filename: {barcode}_1280x720.jpg
+URL format: https://drive.google.com/uc?export=view&id=FILE_ID
 """
 
 import streamlit as st
@@ -24,18 +27,21 @@ import base64
 import unicodedata
 import io
 import os
-import zipfile
 from urllib.parse import urlparse
 from datetime import datetime
 from PIL import Image, ImageOps
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from google.oauth2.service_account import Credentials
 
 # ==========================================
 # ΡΥΘΜΙΣΕΙΣ
 # ==========================================
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
-# v1.1: SHEET_URL από secrets ώστε να μη γίνεται δημόσιο σε public repo
 SHEET_URL = st.secrets.get("SHEET_URL", "")
+# v1.1: Google Drive folder ID για το image hosting
+DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
 
 GEMINI_VISION_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
@@ -328,6 +334,86 @@ def process_image(img):
 
 
 # ==========================================
+# GOOGLE DRIVE UPLOAD (v1.1)
+# ==========================================
+_drive_service_cache = None
+
+
+def get_drive_service():
+    """Lazy-load Google Drive API client, cached σε module level."""
+    global _drive_service_cache
+    if _drive_service_cache is not None:
+        return _drive_service_cache
+    creds_info = json.loads(st.secrets["GOOGLE_CREDENTIALS"], strict=False)
+    if "private_key" in creds_info:
+        creds_info["private_key"] = creds_info["private_key"].replace('\\n', '\n')
+    credentials = Credentials.from_service_account_info(
+        creds_info,
+        scopes=["https://www.googleapis.com/auth/drive"],
+    )
+    _drive_service_cache = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    return _drive_service_cache
+
+
+def upload_to_drive(image_pil, filename, folder_id):
+    """
+    Ανεβάζει PIL image σε Google Drive.
+    Επιστρέφει public URL ή None σε αποτυχία.
+    """
+    if not folder_id:
+        return None
+    try:
+        # Save PIL image σε bytes
+        buf = io.BytesIO()
+        image_pil.save(buf, format="JPEG", quality=92)
+        buf.seek(0)
+
+        service = get_drive_service()
+
+        # Check αν υπάρχει ήδη file με ίδιο όνομα στο folder
+        # (αν ναι, το κάνουμε overwrite για να μη γεμίσει με duplicates)
+        existing = service.files().list(
+            q=f"name='{filename}' and '{folder_id}' in parents and trashed=false",
+            fields="files(id)",
+        ).execute()
+
+        media = MediaIoBaseUpload(buf, mimetype="image/jpeg", resumable=False)
+
+        if existing.get("files"):
+            # Update existing
+            file_id = existing["files"][0]["id"]
+            service.files().update(fileId=file_id, media_body=media).execute()
+        else:
+            # Create new
+            file_metadata = {
+                "name": filename,
+                "parents": [folder_id],
+            }
+            file = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id",
+            ).execute()
+            file_id = file.get("id")
+
+            # Make it public (Anyone with link → Viewer)
+            service.permissions().create(
+                fileId=file_id,
+                body={"type": "anyone", "role": "reader"},
+                fields="id",
+            ).execute()
+
+        # Public URL — direct-view format works για most PIM systems
+        return f"https://drive.google.com/uc?export=view&id={file_id}"
+
+    except Exception as e:
+        st.session_state.setdefault("_errors", []).append(
+            f"Drive upload για {filename} απέτυχε: {e}"
+        )
+        return None
+
+
+# ==========================================
 # MAIN PIPELINE (per row)
 # ==========================================
 def find_and_process(barcode, rough_desc, debug_log):
@@ -424,10 +510,19 @@ def update_row(sheet, row_num, local_filename, status):
 # ==========================================
 # UI
 # ==========================================
-st.set_page_config(page_title="Image Processor v1.0", page_icon="🖼️")
+st.set_page_config(page_title="Image Processor v1.1", page_icon="🖼️")
 
-st.title("🖼️ Image Processor v1.0")
-st.caption("Βρίσκει, επαληθεύει και επεξεργάζεται εικόνες σε 1280×720 λευκό φόντο")
+st.title("🖼️ Image Processor v1.1")
+st.caption("Βρίσκει, επαληθεύει και επεξεργάζεται εικόνες σε 1280×720 λευκό φόντο → Google Drive")
+
+# v1.1: Warning αν λείπει το DRIVE_FOLDER_ID
+if not DRIVE_FOLDER_ID:
+    st.error(
+        "⚠️ Λείπει το `DRIVE_FOLDER_ID` από τα secrets. "
+        "Πρόσθεσε στο Streamlit Cloud → Settings → Secrets:\n\n"
+        "`DRIVE_FOLDER_ID = \"το_folder_id_σου\"`"
+    )
+    st.stop()
 
 st.markdown("---")
 
@@ -440,20 +535,26 @@ skip_processed = st.checkbox(
     value=True,
 )
 
-with st.expander("ℹ️ Πληροφορίες"):
+with st.expander("ℹ️ Πώς δουλεύει"):
     st.markdown(f"""
-**Πώς δουλεύει:**
+**Ροή:**
 1. Διαβάζει barcode + rough_desc από στήλες D & E
 2. Ψάχνει εικόνες με Serper (πολλαπλά queries)
 3. Vision check (Gemini) — απορρίπτει watermarks, wrong products, colored backgrounds
 4. Αν βρεθεί καλή εικόνα → auto-crop + center σε 1280×720 canvas με λευκό φόντο
-5. Save τοπικά, γράφει status στη στήλη AB
-6. Στο τέλος: ZIP download με όλες τις εικόνες
+5. **Ανεβάζει την εικόνα σε Google Drive** (public URL)
+6. Γράφει στο sheet:
+   - Στήλη **L**: το public URL της εικόνας
+   - Στήλη **AB**: status (✅ Processed / ⚠️ Not found)
+
+**Filename**: `{{barcode}}_1280x720.jpg`
 
 **Filters:**
 - Vision score min: **{VISION_SCORE_MIN}**
 - Min input resolution: **{MIN_INPUT_SIZE}px** στην κοντύτερη πλευρά
 - Max candidates check per row: **{MAX_VISION_CHECKS}**
+
+**Παράδειγμα URL:** `https://drive.google.com/uc?export=view&id=XXXXXX`
 """)
 
 if "processed_images" not in st.session_state:
@@ -520,20 +621,31 @@ if st.button("🚀 Start Processing", type="primary"):
             all_debug.extend(row_debug)
 
             if processed:
-                # Save to session
+                # v1.1: Upload σε Google Drive αντί για local session storage
+                filename = f"{barcode}_1280x720.jpg"
+                drive_url = upload_to_drive(processed, filename, DRIVE_FOLDER_ID)
+
+                # Keep preview στο session (για UI display μόνο)
                 buf = io.BytesIO()
                 processed.save(buf, format="JPEG", quality=92)
-                filename = f"{barcode}.jpg"
                 st.session_state["processed_images"][filename] = buf.getvalue()
 
-                # Update sheet
-                try:
-                    update_row(sheet, row_num, filename, status_msg)
-                except Exception as e:
-                    all_debug.append(f"  ⚠ sheet update failed: {e}")
-
-                stats["processed"] += 1
-                status_box.success(f"✅ Γραμμή {row_num}: {status_msg}")
+                if drive_url:
+                    # Update sheet: L = public URL, AB = status
+                    try:
+                        update_row(sheet, row_num, drive_url, status_msg)
+                    except Exception as e:
+                        all_debug.append(f"  ⚠ sheet update failed: {e}")
+                    stats["processed"] += 1
+                    status_box.success(f"✅ Γραμμή {row_num}: {status_msg} → {drive_url[:60]}...")
+                else:
+                    # Upload failed
+                    try:
+                        update_row(sheet, row_num, "", "❌ Drive upload failed")
+                    except Exception:
+                        pass
+                    stats["error"] += 1
+                    status_box.error(f"❌ Γραμμή {row_num}: Drive upload failed")
             else:
                 # Update sheet with status only
                 try:
@@ -575,19 +687,5 @@ if st.button("🚀 Start Processing", type="primary"):
         st.error(f"❌ Σφάλμα: {e}")
         st.exception(e)
 
-# ZIP Download button (persistent)
-if st.session_state.get("processed_images"):
-    st.markdown("---")
-    st.markdown("### 📦 Bulk Download")
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname, img_bytes in st.session_state["processed_images"].items():
-            zf.writestr(fname, img_bytes)
-    zip_buf.seek(0)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button(
-        label=f"⬇️ Download ZIP ({len(st.session_state['processed_images'])} images)",
-        data=zip_buf.getvalue(),
-        file_name=f"processed_images_{timestamp}.zip",
-        mime="application/zip",
-    )
+# v1.1: ZIP download αφαιρέθηκε — τα URLs είναι πλέον στο sheet (στήλη L)
+# και οι εικόνες hosted στο Google Drive folder.
