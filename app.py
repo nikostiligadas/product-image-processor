@@ -1,5 +1,5 @@
 """
-Image Processor v1.4 — με Google Drive upload
+Image Processor v1.5 — με Google Drive upload
 ==============================================================
 
 Standalone Streamlit εργαλείο που:
@@ -435,6 +435,12 @@ def find_and_process(barcode, rough_desc, debug_log):
     Βρίσκει τη σωστή εικόνα και την επεξεργάζεται.
     Επιστρέφει (processed_PIL_or_None, status_msg, chosen_url_or_None, chosen_score, usage).
     usage = {"serper": N, "vision": M}
+
+    v1.5: Two-pass strategy:
+      Pass 1: ψάχνει εικόνα με λευκό φόντο + καλό score → προτεραιότητα
+      Pass 2 (fallback): αν το Pass 1 απέτυχε, παίρνει την καλύτερη εικόνα
+              που ήταν match=True, no watermark, no promo — ακόμη κι αν
+              το φόντο δεν είναι λευκό (το processing θα κάνει ό,τι μπορεί).
     """
     candidates, serper_used = collect_image_candidates(barcode, rough_desc)
     debug_log.append(f"  Found {len(candidates)} candidates from search ({serper_used} Serper queries)")
@@ -445,6 +451,9 @@ def find_and_process(barcode, rough_desc, debug_log):
         return None, "❌ Δεν βρέθηκαν candidates", None, 0, usage
 
     checked = 0
+    # v1.5: Κρατάμε το καλύτερο non-white candidate ως fallback
+    fallback = None  # (score, img, url)
+
     for c in candidates:
         if checked >= MAX_VISION_CHECKS:
             debug_log.append(f"  Reached max checks ({MAX_VISION_CHECKS}), stopping")
@@ -478,7 +487,7 @@ def find_and_process(barcode, rough_desc, debug_log):
             f"promo={promo} whitebg={white_bg} ({c['source']})"
         )
 
-        # Hard rejects
+        # Hard rejects (ισχύουν και για τα δύο passes)
         if watermark:
             debug_log.append(f"    → rejected: watermark")
             continue
@@ -488,21 +497,42 @@ def find_and_process(barcode, rough_desc, debug_log):
         if not matches:
             debug_log.append(f"    → rejected: doesn't match product")
             continue
+
+        # v1.5: Non-white → κράτα ως fallback αλλά μη το δεχτείς άμεσα
         if not white_bg:
-            debug_log.append(f"    → rejected: not white background")
+            # Κρατάμε το καλύτερο (υψηλότερο score) ως fallback
+            if score >= VISION_SCORE_MIN:
+                if fallback is None or score > fallback[0]:
+                    fallback = (score, img, c["url"])
+                    debug_log.append(f"    → κρατήθηκε ως fallback (non-white, score {score})")
+                else:
+                    debug_log.append(f"    → non-white, ήδη έχουμε καλύτερο fallback")
+            else:
+                debug_log.append(f"    → non-white + low score, skip")
             continue
+
         if score < VISION_SCORE_MIN:
             debug_log.append(f"    → rejected: score {score} < {VISION_SCORE_MIN}")
             continue
 
-        # Accepted! Process it
-        debug_log.append(f"  ✓ ACCEPTED: score={score}, {c['url'][:80]}")
+        # Pass 1 accepted! (λευκό φόντο + καλό score)
+        debug_log.append(f"  ✓ ACCEPTED (white bg): score={score}, {c['url'][:80]}")
         try:
             processed = process_image(img)
-            return processed, f"✅ Processed (score {score})", c["url"], score, usage
+            return processed, f"✅ Processed (score {score}, white bg)", c["url"], score, usage
         except Exception as e:
             debug_log.append(f"    → processing failed: {e}")
             continue
+
+    # v1.5: Pass 2 — αν δεν βρέθηκε λευκό, χρησιμοποίησε το fallback
+    if fallback is not None:
+        score, img, url = fallback
+        debug_log.append(f"  ✓ ACCEPTED (fallback non-white): score={score}, {url[:80]}")
+        try:
+            processed = process_image(img)
+            return processed, f"⚠️ Processed (score {score}, non-white bg)", url, score, usage
+        except Exception as e:
+            debug_log.append(f"    → fallback processing failed: {e}")
 
     return None, f"⚠️ Δεν βρέθηκε αποδεκτή εικόνα ({checked} candidates checked)", None, 0, usage
 
@@ -528,9 +558,9 @@ def update_row(sheet, row_num, local_filename, status):
 # ==========================================
 # UI
 # ==========================================
-st.set_page_config(page_title="Image Processor v1.4", page_icon="🖼️")
+st.set_page_config(page_title="Image Processor v1.5", page_icon="🖼️")
 
-st.title("🖼️ Image Processor v1.4")
+st.title("🖼️ Image Processor v1.5")
 st.caption("Βρίσκει, επαληθεύει και επεξεργάζεται εικόνες σε 1280×720 λευκό φόντο → Google Drive")
 
 # v1.1: Warning αν λείπει το DRIVE_FOLDER_ID
