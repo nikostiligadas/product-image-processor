@@ -1,5 +1,5 @@
 """
-Image Processor v1.6 — με Google Drive upload
+Image Processor v1.7 — με Cloudinary upload
 ==============================================================
 
 Standalone Streamlit εργαλείο που:
@@ -10,7 +10,7 @@ Standalone Streamlit εργαλείο που:
    - Auto-crop το προϊόν (remove περιττά κενά)
    - Center σε 1280x720 canvas με λευκό φόντο
 5. Αν δεν βρεθεί κατάλληλη εικόνα → skip
-6. Ανεβάζει την επεξεργασμένη εικόνα σε Google Drive (public)
+6. Ανεβάζει την επεξεργασμένη εικόνα στο Cloudinary (public CDN URL)
 7. Γράφει στο sheet: στήλη L (public URL) + στήλη AB (status)
 
 Filename: {barcode}_1280x720.jpg
@@ -30,10 +30,9 @@ import os
 from urllib.parse import urlparse
 from datetime import datetime
 from PIL import Image, ImageOps
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-from google.oauth2.service_account import Credentials
 from bs4 import BeautifulSoup
+import cloudinary
+import cloudinary.uploader
 
 # ==========================================
 # ΡΥΘΜΙΣΕΙΣ
@@ -41,8 +40,19 @@ from bs4 import BeautifulSoup
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
 SHEET_URL = st.secrets.get("SHEET_URL", "")
-# v1.1: Google Drive folder ID για το image hosting
-DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
+# v1.7: Cloudinary config για image hosting
+CLOUDINARY_CLOUD_NAME = st.secrets.get("CLOUDINARY_CLOUD_NAME", "")
+CLOUDINARY_API_KEY = st.secrets.get("CLOUDINARY_API_KEY", "")
+CLOUDINARY_API_SECRET = st.secrets.get("CLOUDINARY_API_SECRET", "")
+
+# Configure Cloudinary (αν υπάρχουν τα credentials)
+if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+        secure=True,
+    )
 
 GEMINI_VISION_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
@@ -437,81 +447,35 @@ def process_image(img):
 
 
 # ==========================================
-# GOOGLE DRIVE UPLOAD (v1.1)
+# CLOUDINARY UPLOAD (v1.7)
 # ==========================================
-_drive_service_cache = None
-
-
-def get_drive_service():
-    """Lazy-load Google Drive API client, cached σε module level."""
-    global _drive_service_cache
-    if _drive_service_cache is not None:
-        return _drive_service_cache
-    creds_info = json.loads(st.secrets["GOOGLE_CREDENTIALS"], strict=False)
-    if "private_key" in creds_info:
-        creds_info["private_key"] = creds_info["private_key"].replace('\\n', '\n')
-    credentials = Credentials.from_service_account_info(
-        creds_info,
-        scopes=["https://www.googleapis.com/auth/drive"],
-    )
-    _drive_service_cache = build("drive", "v3", credentials=credentials, cache_discovery=False)
-    return _drive_service_cache
-
-
-def upload_to_drive(image_pil, filename, folder_id):
+def upload_to_cloudinary(image_pil, barcode):
     """
-    Ανεβάζει PIL image σε Google Drive.
-    Επιστρέφει public URL ή None σε αποτυχία.
+    Ανεβάζει PIL image στο Cloudinary.
+    Επιστρέφει secure_url ή None σε αποτυχία.
+
+    public_id = barcode ώστε re-runs να κάνουν overwrite (όχι duplicates).
     """
-    if not folder_id:
-        return None
     try:
-        # Save PIL image σε bytes
+        # Save PIL image σε bytes buffer
         buf = io.BytesIO()
         image_pil.save(buf, format="JPEG", quality=92)
         buf.seek(0)
 
-        service = get_drive_service()
-
-        # Check αν υπάρχει ήδη file με ίδιο όνομα στο folder
-        # (αν ναι, το κάνουμε overwrite για να μη γεμίσει με duplicates)
-        existing = service.files().list(
-            q=f"name='{filename}' and '{folder_id}' in parents and trashed=false",
-            fields="files(id)",
-        ).execute()
-
-        media = MediaIoBaseUpload(buf, mimetype="image/jpeg", resumable=False)
-
-        if existing.get("files"):
-            # Update existing
-            file_id = existing["files"][0]["id"]
-            service.files().update(fileId=file_id, media_body=media).execute()
-        else:
-            # Create new
-            file_metadata = {
-                "name": filename,
-                "parents": [folder_id],
-            }
-            file = service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields="id",
-            ).execute()
-            file_id = file.get("id")
-
-            # Make it public (Anyone with link → Viewer)
-            service.permissions().create(
-                fileId=file_id,
-                body={"type": "anyone", "role": "reader"},
-                fields="id",
-            ).execute()
-
-        # Public URL — direct-view format works για most PIM systems
-        return f"https://drive.google.com/uc?export=view&id={file_id}"
+        result = cloudinary.uploader.upload(
+            buf,
+            public_id=str(barcode),          # filename = barcode
+            folder="product_images",         # οργάνωση σε folder μέσα στο Cloudinary
+            overwrite=True,                   # re-run → αντικατάσταση
+            invalidate=True,                  # καθάρισμα CDN cache στο overwrite
+            resource_type="image",
+            format="jpg",
+        )
+        return result.get("secure_url")
 
     except Exception as e:
         st.session_state.setdefault("_errors", []).append(
-            f"Drive upload για {filename} απέτυχε: {e}"
+            f"Cloudinary upload για {barcode} απέτυχε: {e}"
         )
         return None
 
@@ -647,17 +611,21 @@ def update_row(sheet, row_num, local_filename, status):
 # ==========================================
 # UI
 # ==========================================
-st.set_page_config(page_title="Image Processor v1.6", page_icon="🖼️")
+st.set_page_config(page_title="Image Processor v1.7", page_icon="🖼️")
 
-st.title("🖼️ Image Processor v1.6")
-st.caption("Βρίσκει, επαληθεύει και επεξεργάζεται εικόνες σε 1280×720 λευκό φόντο → Google Drive")
+st.title("🖼️ Image Processor v1.7")
+st.caption("Βρίσκει, επαληθεύει και επεξεργάζεται εικόνες σε 1280×720 λευκό φόντο → Cloudinary")
 
-# v1.1: Warning αν λείπει το DRIVE_FOLDER_ID
-if not DRIVE_FOLDER_ID:
+# v1.7: Warning αν λείπουν τα Cloudinary credentials
+if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET):
     st.error(
-        "⚠️ Λείπει το `DRIVE_FOLDER_ID` από τα secrets. "
+        "⚠️ Λείπουν τα Cloudinary credentials από τα secrets. "
         "Πρόσθεσε στο Streamlit Cloud → Settings → Secrets:\n\n"
-        "`DRIVE_FOLDER_ID = \"το_folder_id_σου\"`"
+        "```\n"
+        "CLOUDINARY_CLOUD_NAME = \"το_cloud_name_σου\"\n"
+        "CLOUDINARY_API_KEY = \"το_api_key_σου\"\n"
+        "CLOUDINARY_API_SECRET = \"το_api_secret_σου\"\n"
+        "```"
     )
     st.stop()
 
@@ -679,7 +647,7 @@ with st.expander("ℹ️ Πώς δουλεύει"):
 2. Ψάχνει εικόνες με Serper (πολλαπλά queries)
 3. Vision check (Gemini) — απορρίπτει watermarks, wrong products, colored backgrounds
 4. Αν βρεθεί καλή εικόνα → auto-crop + center σε 1280×720 canvas με λευκό φόντο
-5. **Ανεβάζει την εικόνα σε Google Drive** (public URL)
+5. **Ανεβάζει την εικόνα στο Cloudinary** (public CDN URL)
 6. Γράφει στο sheet:
    - Στήλη **L**: το public URL της εικόνας
    - Στήλη **AB**: status (✅ Processed / ⚠️ Not found)
@@ -795,31 +763,31 @@ if start_clicked:
             cost_gemini += usage.get("vision", 0) * 0.00014
 
             if processed:
-                # v1.1: Upload σε Google Drive αντί για local session storage
+                # v1.7: Upload σε Cloudinary
                 filename = f"{barcode}_1280x720.jpg"
-                drive_url = upload_to_drive(processed, filename, DRIVE_FOLDER_ID)
+                image_url = upload_to_cloudinary(processed, barcode)
 
                 # Keep preview στο session (για UI display μόνο)
                 buf = io.BytesIO()
                 processed.save(buf, format="JPEG", quality=92)
                 st.session_state["processed_images"][filename] = buf.getvalue()
 
-                if drive_url:
+                if image_url:
                     # Update sheet: L = public URL, AB = status
                     try:
-                        update_row(sheet, row_num, drive_url, status_msg)
+                        update_row(sheet, row_num, image_url, status_msg)
                     except Exception as e:
                         all_debug.append(f"  ⚠ sheet update failed: {e}")
                     stats["processed"] += 1
-                    status_box.success(f"✅ Γραμμή {row_num}: {status_msg} → {drive_url[:60]}...")
+                    status_box.success(f"✅ Γραμμή {row_num}: {status_msg} → {image_url[:60]}...")
                 else:
                     # Upload failed
                     try:
-                        update_row(sheet, row_num, "", "❌ Drive upload failed")
+                        update_row(sheet, row_num, "", "❌ Cloudinary upload failed")
                     except Exception:
                         pass
                     stats["error"] += 1
-                    status_box.error(f"❌ Γραμμή {row_num}: Drive upload failed")
+                    status_box.error(f"❌ Γραμμή {row_num}: Cloudinary upload failed")
             else:
                 # Update sheet with status only
                 try:
@@ -922,4 +890,4 @@ if start_clicked:
         st.exception(e)
 
 # v1.1: ZIP download αφαιρέθηκε — τα URLs είναι πλέον στο sheet (στήλη L)
-# και οι εικόνες hosted στο Google Drive folder.
+# και οι εικόνες hosted στο Cloudinary CDN.
