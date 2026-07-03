@@ -1,5 +1,5 @@
 """
-Image Processor v1.5 — με Google Drive upload
+Image Processor v1.6 — με Google Drive upload
 ==============================================================
 
 Standalone Streamlit εργαλείο που:
@@ -33,6 +33,7 @@ from PIL import Image, ImageOps
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from google.oauth2.service_account import Credentials
+from bs4 import BeautifulSoup
 
 # ==========================================
 # ΡΥΘΜΙΣΕΙΣ
@@ -130,14 +131,74 @@ def serper_image_search(query, gl="gr", num=10):
         if r.status_code == 200:
             return r.json().get("images", [])
     except Exception as e:
-        st.session_state.setdefault("_errors", []).append(f"Serper: {e}")
+        st.session_state.setdefault("_errors", []).append(f"Serper images: {e}")
     return []
+
+
+def serper_web_search(query, gl="gr", num=10):
+    """v1.6: Web search (organic results) — για να βρούμε e-shop product pages."""
+    url = "https://google.serper.dev/search"
+    headers = {'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json'}
+    try:
+        r = requests.post(url, json={"q": query, "gl": gl, "hl": "el", "num": num},
+                          headers=headers, timeout=15)
+        if r.status_code == 200:
+            return r.json().get("organic", [])
+    except Exception as e:
+        st.session_state.setdefault("_errors", []).append(f"Serper web: {e}")
+    return []
+
+
+def scrape_product_image_from_page(page_url):
+    """
+    v1.6: Ανοίγει μια e-shop σελίδα προϊόντος και εξάγει την κύρια εικόνα.
+    Ψάχνει (με σειρά προτεραιότητας):
+      1. og:image meta tag (η επίσημη εικόνα preview — σχεδόν πάντα η μεγάλη)
+      2. twitter:image meta tag
+      3. link rel=image_src
+    Επιστρέφει το image URL ή None.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "el-GR,el;q=0.9,en;q=0.8",
+    }
+    try:
+        r = requests.get(page_url, timeout=12, headers=headers)
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # 1. og:image
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            return og["content"].strip()
+
+        # 2. twitter:image
+        tw = soup.find("meta", attrs={"name": "twitter:image"})
+        if tw and tw.get("content"):
+            return tw["content"].strip()
+
+        # 3. link rel=image_src
+        link_img = soup.find("link", rel="image_src")
+        if link_img and link_img.get("href"):
+            return link_img["href"].strip()
+
+    except Exception:
+        pass
+    return None
 
 
 def collect_image_candidates(barcode, rough_desc):
     """
-    Επιστρέφει list of {url, title, source} candidates.
-    Χρησιμοποιεί πολλαπλά queries με προτίμηση σε manufacturer/pharmacy sites.
+    v1.6: Δύο μέθοδοι αναζήτησης:
+      A) Google Images (γρήγορο, thumbnails)
+      B) Web Search + og:image scraping (όπως κάνει άνθρωπος: ανοίγει το e-shop)
+
+    Επιστρέφει (candidates, serper_queries_used).
     """
     barcode = (barcode or "").strip()
     clean_bc = barcode.lstrip('0') or barcode
@@ -145,20 +206,20 @@ def collect_image_candidates(barcode, rough_desc):
     rough_desc = " ".join((rough_desc or "").split())
 
     queries = []
-    # Q1: brand + rest of description
     if brand:
         rest = rough_desc[len(brand):].strip()
         if rest:
             queries.append(f'"{brand}" {rest}')
         queries.append(f'"{brand}" {clean_bc}')
-    # Q2: rough_desc + barcode
     queries.append(f'{rough_desc} {clean_bc}')
     queries.append(rough_desc)
 
     seen = set()
     candidates = []
     serper_queries_used = 0
-    for q in queries:
+
+    # ===== ΜΕΘΟΔΟΣ A: Google Images (γρήγορο) =====
+    for q in queries[:2]:  # πρώτα 2 queries για images
         results = serper_image_search(q)
         serper_queries_used += 1
         for img in results:
@@ -176,9 +237,37 @@ def collect_image_candidates(barcode, rough_desc):
                 "title": title[:80],
                 "source": domain_of(img.get("link", "") or img.get("source", "")),
                 "query": q[:60],
+                "method": "images",
             })
             if len(candidates) >= MAX_IMAGE_CANDIDATES:
                 return candidates, serper_queries_used
+
+    # ===== ΜΕΘΟΔΟΣ B: Web search + og:image scraping =====
+    # Αυτό μιμείται τη διαδικασία σου: ψάχνεις, ανοίγεις e-shop, παίρνεις εικόνα.
+    for q in queries[:2]:
+        pages = serper_web_search(q)
+        serper_queries_used += 1
+        for page in pages[:5]:  # top-5 e-shop pages ανά query
+            page_url = page.get("link", "")
+            page_title = page.get("title", "")
+            if not page_url:
+                continue
+            if looks_like_promo(page_title):
+                continue
+            # Scrape την κύρια εικόνα από τη σελίδα
+            img_url = scrape_product_image_from_page(page_url)
+            if img_url and img_url not in seen:
+                seen.add(img_url)
+                candidates.append({
+                    "url": img_url,
+                    "title": page_title[:80],
+                    "source": domain_of(page_url),
+                    "query": q[:60],
+                    "method": "web+og:image",
+                })
+                if len(candidates) >= MAX_IMAGE_CANDIDATES:
+                    return candidates, serper_queries_used
+
     return candidates, serper_queries_used
 
 
@@ -484,7 +573,7 @@ def find_and_process(barcode, rough_desc, debug_log):
 
         debug_log.append(
             f"  #{checked} score={score} match={matches} watermark={watermark} "
-            f"promo={promo} whitebg={white_bg} ({c['source']})"
+            f"promo={promo} whitebg={white_bg} ({c['source']} via {c.get('method', '?')})"
         )
 
         # Hard rejects (ισχύουν και για τα δύο passes)
@@ -558,9 +647,9 @@ def update_row(sheet, row_num, local_filename, status):
 # ==========================================
 # UI
 # ==========================================
-st.set_page_config(page_title="Image Processor v1.5", page_icon="🖼️")
+st.set_page_config(page_title="Image Processor v1.6", page_icon="🖼️")
 
-st.title("🖼️ Image Processor v1.5")
+st.title("🖼️ Image Processor v1.6")
 st.caption("Βρίσκει, επαληθεύει και επεξεργάζεται εικόνες σε 1280×720 λευκό φόντο → Google Drive")
 
 # v1.1: Warning αν λείπει το DRIVE_FOLDER_ID
