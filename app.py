@@ -1,5 +1,5 @@
 """
-Image Processor v1.1 — με Google Drive upload
+Image Processor v1.4 — με Google Drive upload
 ==============================================================
 
 Standalone Streamlit εργαλείο που:
@@ -58,8 +58,8 @@ MIN_INPUT_SIZE = 300  # ελάχιστη ανάλυση εισόδου (κοντ
 VISION_SCORE_MIN = 55  # αρκετά αυστηρό για να φιλτράρει watermarks/wrong products
 
 # Search
-MAX_IMAGE_CANDIDATES = 12  # παίρνουμε περισσότερες candidates γιατί φιλτράρουμε αυστηρά
-MAX_VISION_CHECKS = 6
+MAX_IMAGE_CANDIDATES = 15  # παίρνουμε περισσότερες candidates γιατί φιλτράρουμε αυστηρά
+MAX_VISION_CHECKS = 8  # v1.4: αυξήθηκε από 6 → 8 για δύσκολα cases (π.χ. promo-heavy προϊόντα)
 
 # ==========================================
 # HELPERS
@@ -157,8 +157,10 @@ def collect_image_candidates(barcode, rough_desc):
 
     seen = set()
     candidates = []
+    serper_queries_used = 0
     for q in queries:
         results = serper_image_search(q)
+        serper_queries_used += 1
         for img in results:
             url = img.get("imageUrl", "")
             if not url or url in seen:
@@ -176,8 +178,8 @@ def collect_image_candidates(barcode, rough_desc):
                 "query": q[:60],
             })
             if len(candidates) >= MAX_IMAGE_CANDIDATES:
-                return candidates
-    return candidates
+                return candidates, serper_queries_used
+    return candidates, serper_queries_used
 
 
 # ==========================================
@@ -185,8 +187,20 @@ def collect_image_candidates(barcode, rough_desc):
 # ==========================================
 def fetch_image(url, timeout=12, max_bytes=6_000_000):
     """Κατεβάζει την εικόνα και επιστρέφει PIL Image + raw bytes."""
+    # v1.4: Browser-like headers ώστε sites όπως wecare.gr, blinkshop κλπ
+    # να μη μπλοκάρουν το request ως bot. Αυτό αυξάνει σημαντικά το
+    # success rate των downloads.
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "el-GR,el;q=0.9,en;q=0.8",
+        "Referer": "https://www.google.com/",
+    }
     try:
-        r = requests.get(url, timeout=timeout, stream=True)
+        r = requests.get(url, timeout=timeout, headers=headers, stream=True)
         if r.status_code != 200:
             return None, None
         ctype = r.headers.get("Content-Type", "").split(";")[0].strip()
@@ -419,13 +433,16 @@ def upload_to_drive(image_pil, filename, folder_id):
 def find_and_process(barcode, rough_desc, debug_log):
     """
     Βρίσκει τη σωστή εικόνα και την επεξεργάζεται.
-    Επιστρέφει (processed_PIL_or_None, status_msg, chosen_url_or_None, chosen_score).
+    Επιστρέφει (processed_PIL_or_None, status_msg, chosen_url_or_None, chosen_score, usage).
+    usage = {"serper": N, "vision": M}
     """
-    candidates = collect_image_candidates(barcode, rough_desc)
-    debug_log.append(f"  Found {len(candidates)} candidates from search")
+    candidates, serper_used = collect_image_candidates(barcode, rough_desc)
+    debug_log.append(f"  Found {len(candidates)} candidates from search ({serper_used} Serper queries)")
+
+    usage = {"serper": serper_used, "vision": 0}
 
     if not candidates:
-        return None, "❌ Δεν βρέθηκαν candidates", None, 0
+        return None, "❌ Δεν βρέθηκαν candidates", None, 0, usage
 
     checked = 0
     for c in candidates:
@@ -449,6 +466,7 @@ def find_and_process(barcode, rough_desc, debug_log):
         v = vision_check(raw_bytes, mime, barcode, rough_desc)
         score = int(v.get("score", 0) or 0)
         checked += 1
+        usage["vision"] += 1
 
         watermark = v.get("has_watermark", False)
         promo = v.get("is_promo_or_bundle", False)
@@ -481,12 +499,12 @@ def find_and_process(barcode, rough_desc, debug_log):
         debug_log.append(f"  ✓ ACCEPTED: score={score}, {c['url'][:80]}")
         try:
             processed = process_image(img)
-            return processed, f"✅ Processed (score {score})", c["url"], score
+            return processed, f"✅ Processed (score {score})", c["url"], score, usage
         except Exception as e:
             debug_log.append(f"    → processing failed: {e}")
             continue
 
-    return None, f"⚠️ Δεν βρέθηκε αποδεκτή εικόνα ({checked} candidates checked)", None, 0
+    return None, f"⚠️ Δεν βρέθηκε αποδεκτή εικόνα ({checked} candidates checked)", None, 0, usage
 
 
 # ==========================================
@@ -510,9 +528,9 @@ def update_row(sheet, row_num, local_filename, status):
 # ==========================================
 # UI
 # ==========================================
-st.set_page_config(page_title="Image Processor v1.1", page_icon="🖼️")
+st.set_page_config(page_title="Image Processor v1.4", page_icon="🖼️")
 
-st.title("🖼️ Image Processor v1.1")
+st.title("🖼️ Image Processor v1.4")
 st.caption("Βρίσκει, επαληθεύει και επεξεργάζεται εικόνες σε 1280×720 λευκό φόντο → Google Drive")
 
 # v1.1: Warning αν λείπει το DRIVE_FOLDER_ID
@@ -560,7 +578,19 @@ with st.expander("ℹ️ Πώς δουλεύει"):
 if "processed_images" not in st.session_state:
     st.session_state["processed_images"] = {}  # barcode → PIL image bytes
 
-if st.button("🚀 Start Processing", type="primary"):
+# v1.2: Stop flag για διακοπή του processing
+if "stop_requested" not in st.session_state:
+    st.session_state["stop_requested"] = False
+
+col_start, col_stop = st.columns([3, 1])
+start_clicked = col_start.button("🚀 Start Processing", type="primary")
+if col_stop.button("⏹️ Stop", type="secondary"):
+    st.session_state["stop_requested"] = True
+    st.warning("⏹️ Ζητήθηκε διακοπή — θα σταματήσει μετά την τρέχουσα γραμμή.")
+
+if start_clicked:
+    # Reset stop flag στην αρχή κάθε run
+    st.session_state["stop_requested"] = False
     try:
         creds = json.loads(st.secrets["GOOGLE_CREDENTIALS"], strict=False)
         if "private_key" in creds:
@@ -580,11 +610,32 @@ if st.button("🚀 Start Processing", type="primary"):
         all_debug = []
         run_start = time.time()
 
+        # v1.3: Cost & time tracking
+        # Pricing references:
+        #   Gemini 2.5 Flash Vision: ~$0.075/1M input, $0.30/1M output tokens
+        #     ανά vision call: ~1250 in (image + prompt) + 150 out → ~$0.00014
+        #   Serper.dev: $0.30 / 1000 queries → $0.0003/query
+        # Ανά γραμμή (τυπικά): έως 4 Serper queries + έως 6 vision checks
+        cost_gemini = 0.0
+        cost_serper = 0.0
+        row_times = []  # χρόνος ανά γραμμή για avg
+
         # Clear previous session images
         st.session_state["processed_images"] = {}
 
         total = end_row - start_row + 1
         for i, row_num in enumerate(range(start_row, end_row + 1)):
+            row_start_time = time.time()  # v1.3: per-row timing
+            # v1.2: Stop check
+            if st.session_state.get("stop_requested"):
+                all_debug.append(
+                    f"⏹️ Σταμάτησε στη γραμμή {row_num} κατόπιν αιτήματος χρήστη"
+                )
+                status_box.warning(
+                    f"⏹️ Διακοπή στη γραμμή {row_num}. "
+                    f"Όσες γραμμές προηγήθηκαν έχουν γραφτεί στο sheet."
+                )
+                break
             actual_idx = row_num - 1
             if actual_idx >= len(data):
                 stats["skipped"] += 1
@@ -609,7 +660,7 @@ if st.button("🚀 Start Processing", type="primary"):
 
             row_debug = [f"Γραμμή {row_num} ({barcode}): {rough_desc[:60]}"]
             try:
-                processed, status_msg, chosen_url, chosen_score = find_and_process(
+                processed, status_msg, chosen_url, chosen_score, usage = find_and_process(
                     barcode, rough_desc, row_debug
                 )
             except Exception as e:
@@ -619,6 +670,10 @@ if st.button("🚀 Start Processing", type="primary"):
                 continue
 
             all_debug.extend(row_debug)
+
+            # v1.3: Cost accumulation
+            cost_serper += usage.get("serper", 0) * 0.0003
+            cost_gemini += usage.get("vision", 0) * 0.00014
 
             if processed:
                 # v1.1: Upload σε Google Drive αντί για local session storage
@@ -656,6 +711,8 @@ if st.button("🚀 Start Processing", type="primary"):
                 status_box.warning(f"⚠️ Γραμμή {row_num}: {status_msg}")
 
             progress_bar.progress((i + 1) / total)
+            # v1.3: Record row time (πριν το sleep για καθαρό processing time)
+            row_times.append(time.time() - row_start_time)
             time.sleep(1.5)  # Rate limiting για Gemini
 
         elapsed = time.time() - run_start
@@ -668,6 +725,56 @@ if st.button("🚀 Start Processing", type="primary"):
         c2.metric("⚠️ Not found", stats["not_found"])
         c3.metric("⏭️ Skipped", stats["skipped"])
         c4.metric("❌ Errors", stats["error"])
+
+        # v1.3: Cost & Time dashboard
+        st.markdown("### 💰 Κόστος & Χρόνος")
+        cost_total = cost_gemini + cost_serper
+        rows_done = stats["processed"] + stats["not_found"] + stats["error"]
+
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("💵 Total cost", f"${cost_total:.4f}")
+        cc1.caption(f"Gemini Vision: ${cost_gemini:.4f} · Serper: ${cost_serper:.4f}")
+
+        if rows_done > 0:
+            cost_per_row = cost_total / rows_done
+            # Χρησιμοποιούμε το row_times (καθαρός χρόνος χωρίς sleep) για avg
+            if row_times:
+                avg_time = sum(row_times) / len(row_times)
+            else:
+                avg_time = elapsed / rows_done
+            cc2.metric("📈 Cost/row", f"${cost_per_row:.5f}")
+            cc2.caption(f"Επεξεργάστηκαν {rows_done} γραμμές")
+            cc3.metric("⏱️ Time/row", f"{avg_time:.1f}s")
+            cc3.caption(f"Συνολικός χρόνος: {elapsed/60:.1f} min")
+
+            # Projection για 1000 γραμμές
+            proj_cost = cost_per_row * 1000
+            # Ρεαλιστικός χρόνος: avg_time + 1.5s sleep ανά γραμμή
+            proj_time_hours = ((avg_time + 1.5) * 1000) / 3600
+            st.info(
+                f"📊 **Projection για 1000 γραμμές με αυτό το mix:** "
+                f"~${proj_cost:.2f} · ~{proj_time_hours:.1f} ώρες "
+                f"({proj_time_hours*60:.0f} λεπτά)"
+            )
+
+            with st.expander("📖 Reference: pricing & calls"):
+                st.markdown(f"""
+**Pricing reference:**
+- Gemini 2.5 Flash Vision: ~$0.00014 ανά image check
+- Serper.dev: $0.0003 ανά query
+
+**Calls ανά γραμμή (τυπικά):**
+- Serper queries: έως 4 (brand+rest, brand+barcode, desc+barcode, desc)
+- Vision checks: έως {MAX_VISION_CHECKS} (σταματάει μόλις βρει αποδεκτή)
+
+**Αυτό το run:**
+- Σύνολο Serper queries: {int(cost_serper / 0.0003)}
+- Σύνολο Vision checks: {int(cost_gemini / 0.00014)}
+- Μέσος χρόνος/γραμμή: {avg_time:.1f}s (καθαρός, χωρίς rate-limit sleep)
+""")
+        else:
+            cc2.metric("📈 Cost/row", "—")
+            cc3.metric("⏱️ Time/row", f"{elapsed:.1f}s total")
 
         # Show images
         if st.session_state["processed_images"]:
@@ -682,6 +789,14 @@ if st.button("🚀 Start Processing", type="primary"):
         with st.expander(f"🔍 Debug log ({len(all_debug)} lines)"):
             for line in all_debug:
                 st.text(line)
+
+        # v1.1: Errors expander (Drive/Serper/Vision)
+        errors = st.session_state.get("_errors", [])
+        if errors:
+            with st.expander(f"⚠️ Errors ({len(errors)})", expanded=True):
+                for err in errors:
+                    st.text(err)
+            st.session_state["_errors"] = []
 
     except Exception as e:
         st.error(f"❌ Σφάλμα: {e}")
