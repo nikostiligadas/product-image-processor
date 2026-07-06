@@ -1,5 +1,5 @@
 """
-Image Processor v1.7 — με Cloudinary upload
+Image Processor v1.9 — με Cloudinary upload
 ==============================================================
 
 Standalone Streamlit εργαλείο που:
@@ -63,7 +63,7 @@ GEMINI_VISION_URL = (
 OUTPUT_W = 1280
 OUTPUT_H = 720
 MARGIN_RATIO = 0.08  # 8% padding γύρω από το προϊόν
-MIN_INPUT_SIZE = 300  # ελάχιστη ανάλυση εισόδου (κοντύτερη πλευρά)
+MIN_INPUT_SIZE = 250  # v1.6b: μειώθηκε 300→250 (πιάνει περισσότερες usable εικόνες)
 
 # Vision thresholds
 VISION_SCORE_MIN = 55  # αρκετά αυστηρό για να φιλτράρει watermarks/wrong products
@@ -254,10 +254,11 @@ def collect_image_candidates(barcode, rough_desc):
 
     # ===== ΜΕΘΟΔΟΣ B: Web search + og:image scraping =====
     # Αυτό μιμείται τη διαδικασία σου: ψάχνεις, ανοίγεις e-shop, παίρνεις εικόνα.
-    for q in queries[:2]:
+    # v1.6b: 3 queries (αντί 2) + 6 pages ανά query για καλύτερο coverage.
+    for q in queries[:3]:
         pages = serper_web_search(q)
         serper_queries_used += 1
-        for page in pages[:5]:  # top-5 e-shop pages ανά query
+        for page in pages[:6]:  # top-6 e-shop pages ανά query
             page_url = page.get("link", "")
             page_title = page.get("title", "")
             if not page_url:
@@ -285,32 +286,49 @@ def collect_image_candidates(barcode, rough_desc):
 # IMAGE FETCH & VISION
 # ==========================================
 def fetch_image(url, timeout=12, max_bytes=6_000_000):
-    """Κατεβάζει την εικόνα και επιστρέφει PIL Image + raw bytes."""
-    # v1.4: Browser-like headers ώστε sites όπως wecare.gr, blinkshop κλπ
-    # να μη μπλοκάρουν το request ως bot. Αυτό αυξάνει σημαντικά το
-    # success rate των downloads.
-    headers = {
+    """Κατεβάζει την εικόνα και επιστρέφει PIL Image + raw bytes.
+
+    v1.6b: Δοκιμάζει πολλαπλές στρατηγικές headers γιατί μερικά sites
+    (π.χ. kengur.rs με .webp) μπλοκάρουν με Google Referer αλλά επιτρέπουν
+    same-origin Referer ή κανένα Referer.
+    """
+    from urllib.parse import urlparse as _up
+    parsed = _up(url)
+    site_origin = f"{parsed.scheme}://{parsed.netloc}/"
+
+    base_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         "Accept-Language": "el-GR,el;q=0.9,en;q=0.8",
-        "Referer": "https://www.google.com/",
     }
-    try:
-        r = requests.get(url, timeout=timeout, headers=headers, stream=True)
-        if r.status_code != 200:
-            return None, None
-        ctype = r.headers.get("Content-Type", "").split(";")[0].strip()
-        if not ctype.startswith("image/"):
-            return None, None
-        content = r.content[:max_bytes]
-        img = Image.open(io.BytesIO(content))
-        img.load()
-        return img, content
-    except Exception:
-        return None, None
+
+    # Δοκιμάζουμε 3 στρατηγικές Referer με τη σειρά
+    referer_strategies = [
+        {"Referer": site_origin},         # same-origin (πιο φιλικό για hotlink protection)
+        {"Referer": "https://www.google.com/"},  # Google
+        {},                                # κανένα Referer
+    ]
+
+    for ref in referer_strategies:
+        headers = {**base_headers, **ref}
+        try:
+            r = requests.get(url, timeout=timeout, headers=headers, stream=True)
+            if r.status_code != 200:
+                continue
+            ctype = r.headers.get("Content-Type", "").split(";")[0].strip()
+            if not ctype.startswith("image/"):
+                continue
+            content = r.content[:max_bytes]
+            img = Image.open(io.BytesIO(content))
+            img.load()
+            return img, content
+        except Exception:
+            continue
+
+    return None, None
 
 
 def vision_check(image_bytes, mime, barcode, rough_desc):
@@ -451,15 +469,19 @@ def process_image(img):
 # ==========================================
 def upload_to_cloudinary(image_pil, barcode):
     """
-    Ανεβάζει PIL image στο Cloudinary.
+    Ανεβάζει PIL image στο Cloudinary ΑΚΡΙΒΩΣ όπως είναι (1280x720).
     Επιστρέφει secure_url ή None σε αποτυχία.
 
     public_id = barcode ώστε re-runs να κάνουν overwrite (όχι duplicates).
+
+    v1.8: Ρητά ΧΩΡΙΣ transformations ώστε να διατηρηθούν οι διαστάσεις
+    1280x720. Το raw_transformation="" και transformation=[] αποτρέπουν
+    τυχόν eager/incoming transformations από upload presets του account.
     """
     try:
-        # Save PIL image σε bytes buffer
+        # Save PIL image σε bytes buffer — επιβεβαίωση διαστάσεων
         buf = io.BytesIO()
-        image_pil.save(buf, format="JPEG", quality=92)
+        image_pil.save(buf, format="JPEG", quality=95)
         buf.seek(0)
 
         result = cloudinary.uploader.upload(
@@ -470,8 +492,24 @@ def upload_to_cloudinary(image_pil, barcode):
             invalidate=True,                  # καθάρισμα CDN cache στο overwrite
             resource_type="image",
             format="jpg",
+            transformation=[],                # v1.8: καμία μεταμόρφωση
+            eager=[],                         # v1.8: κανένα eager transform
+            transformation_options={},
+            # Απενεργοποίηση auto-optimization που αλλάζει διαστάσεις
+            quality="100",
         )
-        return result.get("secure_url")
+        # v1.8: Το secure_url δείχνει την αποθηκευμένη εικόνα.
+        # Επιβεβαιώνουμε ότι δεν υπάρχει transformation στο URL.
+        url = result.get("secure_url", "")
+        # Log τις πραγματικές διαστάσεις που αποθήκευσε το Cloudinary
+        w = result.get("width")
+        h = result.get("height")
+        if w and h and (w != 1280 or h != 720):
+            st.session_state.setdefault("_errors", []).append(
+                f"⚠️ {barcode}: Cloudinary αποθήκευσε {w}x{h} αντί 1280x720! "
+                f"Έλεγξε τα Upload Presets στο Cloudinary account."
+            )
+        return url
 
     except Exception as e:
         st.session_state.setdefault("_errors", []).append(
@@ -611,9 +649,9 @@ def update_row(sheet, row_num, local_filename, status):
 # ==========================================
 # UI
 # ==========================================
-st.set_page_config(page_title="Image Processor v1.7", page_icon="🖼️")
+st.set_page_config(page_title="Image Processor v1.9", page_icon="🖼️")
 
-st.title("🖼️ Image Processor v1.7")
+st.title("🖼️ Image Processor v1.9")
 st.caption("Βρίσκει, επαληθεύει και επεξεργάζεται εικόνες σε 1280×720 λευκό φόντο → Cloudinary")
 
 # v1.7: Warning αν λείπουν τα Cloudinary credentials
